@@ -1,0 +1,13 @@
+[project]
+name = "m5-module-mcp"
+version = "0.1.0"
+description = "M5 Stack モジュール向け MCP サーバー"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0",
+    "httpx>=0.24.0",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
