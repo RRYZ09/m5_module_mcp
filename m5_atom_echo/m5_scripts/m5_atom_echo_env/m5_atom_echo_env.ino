@@ -1,18 +1,16 @@
 /*
  * M5 Atom Echo + ENV PRO (BME688)
- * ボタン長押し (1秒) → 気温・湿度・気圧を日本語で読み上げ / 止める
- * ボタン短押し      → SSE イベント送信のみ (音声なし)
- * HTTP GET /sensors → センサーデータを JSON で返す
- * HTTP GET /help    → 使い方を返す
- * TCP port 81       → SSE: ボタン押下イベントをプッシュ配信
+ * ボタン押し      → SSE イベント送信
+ * HTTP GET /sensors  → センサーデータを JSON で返す
+ * HTTP GET /ble_rssi → GarminとスマホのBLE電波強度を返す
+ * HTTP GET /help     → 使い方を返す
+ * TCP port 81        → SSE: ボタン押下イベントをプッシュ配信
  *
  * [必要ライブラリ]
- *   ESP32-audioI2S      by schreibfaul1
  *   Adafruit BME680 Library + Adafruit Unified Sensor
  *
  * [ピン割り当て]
  *   BME688 I2C: SDA=G26, SCL=G32  (Grove ポート)
- *   Speaker   : BCK=G19, LRCK=G33, DOUT=G22
  *
  * [固定 IP]
  *   ゲートウェイの末尾を .55 に固定
@@ -24,17 +22,18 @@
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include "Adafruit_BME680.h"
-#include <Audio.h>
 #include "credentials.h"
+#include <BLEDevice.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+
+// BLE スキャン対象MACアドレス（大文字）
+#define GARMIN_MAC "64:A3:37:07:83:FD"
+#define PHONE_MAC  "30:E0:44:76:83:0B"
 
 // ---- BME688: Grove G26=SDA, G32=SCL ----
 #define I2C_SDA 26
 #define I2C_SCL 32
-
-// ---- スピーカー NS4168 ----
-#define SPK_BCK  19
-#define SPK_LRCK 33
-#define SPK_DOUT 22
 
 // ---- Static IP (last octet = 55) ----
 #define STATIC_IP_LAST_OCTET 55
@@ -44,23 +43,60 @@ static IPAddress subnet(255, 255, 255, 0);
 static IPAddress dns1(8, 8, 8, 8), dns2(8, 8, 4, 4);
 
 Adafruit_BME680 bme;
-Audio           audio;
 WebServer       server(80);
 WiFiServer      sseServer(81);
 
-static bool bmeOk      = false;
-static bool isSpeaking = false;
-static volatile bool speechDone = false;  // audio_eof_speech から通知
+static bool bmeOk = false;
+
+// ---- BLE RSSI ----
+volatile int  garminRssi  = 0;
+volatile bool garminFound = false;
+volatile int  phoneRssi   = 0;
+volatile bool phoneFound  = false;
+volatile bool bleScanBusy = false;
+
+class BleRssiCallback : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice dev) override {
+    char addr[18];
+    snprintf(addr, sizeof(addr), "%s", dev.getAddress().toString().c_str());
+    for (int i = 0; addr[i]; i++) addr[i] = toupper(addr[i]);
+    if (strcmp(addr, GARMIN_MAC) == 0) {
+      garminRssi = dev.getRSSI();
+      garminFound = true;
+    } else if (strcmp(addr, PHONE_MAC) == 0) {
+      phoneRssi  = dev.getRSSI();
+      phoneFound = true;
+    }
+  }
+};
+static BleRssiCallback bleRssiCb;
+
+void bleScanTask(void* param) {
+  BLEScan* scan = BLEDevice::getScan();
+  scan->setAdvertisedDeviceCallbacks(&bleRssiCb, true);
+  scan->setActiveScan(false);
+  scan->setInterval(100);
+  scan->setWindow(20);
+  for (;;) {
+    garminFound = false;
+    phoneFound  = false;
+    bleScanBusy = true;
+    scan->start(1, false);
+    scan->clearResults();
+    bleScanBusy = false;
+    vTaskDelay(pdMS_TO_TICKS(15000));
+  }
+}
 
 static WiFiClient sseClients[4];
 static int        sseCount = 0;
 
 bool connectWiFi();
-void speakStatus();
 void handleSensors();
 void handleHelp();
+void handleBleRssi();
 void handleSseClients();
-void sendSSEEvent(bool speaking);
+void sendSSEEvent();
 
 // ---------------------------------------------------------------------------
 void setup() {
@@ -86,26 +122,22 @@ void setup() {
     Serial.println("[BME688] OK");
   }
 
-  // スピーカー
-  Serial.println("[INIT] Audio...");
-  audio.setPinout(SPK_BCK, SPK_LRCK, SPK_DOUT);
-  audio.setVolume(21);
-  audio.forceMono(true);    // NS4168 は右チャンネルのみ受信するため両チャンネルを同一にする
-  Audio::audio_info_callback = [](Audio::msg_t m) {
-    Serial.printf("[Audio +%lums] evt=%d %s\n", millis(), (int)m.e, m.msg ? m.msg : "");
-    if (m.e == Audio::evt_eof) speechDone = true;
-  };
-  Serial.println("[INIT] Audio OK");
-
   // WiFi
   if (connectWiFi()) {
-    server.on("/sensors", HTTP_GET, handleSensors);
-    server.on("/help",    HTTP_GET, handleHelp);
+    server.on("/sensors",  HTTP_GET, handleSensors);
+    server.on("/ble_rssi", HTTP_GET, handleBleRssi);
+    server.on("/help",     HTTP_GET, handleHelp);
     server.begin();
     sseServer.begin();
-    Serial.printf("[HTTP] http://%s/sensors\n", WiFi.localIP().toString().c_str());
-    Serial.printf("[HTTP] http://%s/help\n",    WiFi.localIP().toString().c_str());
+    Serial.printf("[HTTP] http://%s/sensors\n",  WiFi.localIP().toString().c_str());
+    Serial.printf("[HTTP] http://%s/ble_rssi\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[HTTP] http://%s/help\n",     WiFi.localIP().toString().c_str());
     Serial.printf("[SSE]  http://%s:81/events\n", WiFi.localIP().toString().c_str());
+
+    BLEDevice::init("atom-echo-env");
+    xTaskCreatePinnedToCore(bleScanTask, "ble_scan", 4096, nullptr, 1, nullptr, 0);
+    Serial.printf("[BLE] scan started (heap: %u)\n", ESP.getFreeHeap());
+
     M5.dis.drawpix(0, 0x00ff00);  // 緑: 準備完了
   } else {
     M5.dis.drawpix(0, 0xff0000);  // 赤: WiFi 失敗
@@ -119,32 +151,10 @@ void loop() {
   server.handleClient();
   handleSseClients();
 
-  // ボタン: 長押し → 読み上げ ON/OFF、短押し → SSE 送信のみ
-  if (M5.Btn.wasReleasefor(1000)) {
-    isSpeaking = !isSpeaking;
-    if (isSpeaking) {
-      M5.dis.drawpix(0, 0xffff00);  // 黄: 読み上げ中
-      speakStatus();
-    } else {
-      audio.stopSong();
-      M5.dis.drawpix(0, 0x00ff00);
-      Serial.println("[BTN] long press → stopped");
-    }
-    sendSSEEvent(isSpeaking);
-  } else if (M5.Btn.wasReleased()) {
-    sendSSEEvent(isSpeaking);
-    Serial.println("[BTN] short press → SSE only");
+  if (M5.Btn.wasReleased()) {
+    sendSSEEvent();
+    Serial.println("[BTN] pressed → SSE sent");
   }
-
-  // 読み上げ終了したら自動で止まる (eof_speech コールバック経由で確実に検知)
-  if (isSpeaking && speechDone) {
-    speechDone = false;
-    isSpeaking = false;
-    M5.dis.drawpix(0, 0x00ff00);
-    sendSSEEvent(false);
-  }
-
-  audio.loop();
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +180,24 @@ void handleSensors() {
 }
 
 // ---------------------------------------------------------------------------
+void handleBleRssi() {
+  String json = "{";
+  json += "\"scanning\":" + String(bleScanBusy ? "true" : "false") + ",";
+  json += "\"garmin\":{";
+  json += "\"mac\":\"" + String(GARMIN_MAC) + "\",";
+  json += "\"rssi\":" + String(garminRssi) + ",";
+  json += "\"found\":" + String(garminFound ? "true" : "false");
+  json += "},";
+  json += "\"phone\":{";
+  json += "\"mac\":\"" + String(PHONE_MAC) + "\",";
+  json += "\"rssi\":" + String(phoneRssi) + ",";
+  json += "\"found\":" + String(phoneFound ? "true" : "false");
+  json += "}";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// ---------------------------------------------------------------------------
 void handleHelp() {
   String ip = WiFi.localIP().toString();
   String html =
@@ -182,14 +210,10 @@ void handleHelp() {
     "<table border='1' cellspacing='0'>"
     "<tr><th>エンドポイント</th><th>説明</th><th>レスポンス</th></tr>"
     "<tr><td><code>GET /sensors</code></td><td>気温・湿度・気圧を取得</td><td>JSON</td></tr>"
+    "<tr><td><code>GET /ble_rssi</code></td><td>GarminとスマホのBLE電波強度</td><td>JSON</td></tr>"
     "<tr><td><code>GET /help</code></td><td>この使い方ページ</td><td>HTML</td></tr>"
     "<tr><td><code>TCP :" + ip + ":81</code></td><td>ボタン押下イベント (SSE)</td><td>text/event-stream</td></tr>"
     "</table>"
-    "<h3>/sensors レスポンス例</h3>"
-    "<pre>{\n"
-    "  \"env\": { \"temperature\": 24.5, \"humidity\": 60.0,\n"
-    "            \"pressure\": 1013.25, \"gas_resistance\": 50000 }\n"
-    "}</pre>"
     "<h3>SSE イベント (port 81)</h3>"
     "<pre>const es = new EventSource('http://" + ip + ":81/events');\n"
     "es.onmessage = e => console.log(JSON.parse(e.data));</pre>"
@@ -197,7 +221,6 @@ void handleHelp() {
     "</body></html>";
   server.send(200, "text/html; charset=utf-8", html);
 }
-
 
 // ---------------------------------------------------------------------------
 void handleSseClients() {
@@ -234,17 +257,20 @@ void handleSseClients() {
 }
 
 // ---------------------------------------------------------------------------
-void sendSSEEvent(bool speaking) {
+void sendSSEEvent() {
   if (sseCount == 0) return;
 
-  char buf[256];
+  char buf[384];
   snprintf(buf, sizeof(buf),
-    "data: {\"speaking\":%s,"
-    "\"env\":{\"temperature\":%.1f,\"humidity\":%.0f,\"pressure\":%.0f}}\n\n",
-    speaking ? "true" : "false",
+    "data: {"
+    "\"env\":{\"temperature\":%.1f,\"humidity\":%.0f,\"pressure\":%.0f},"
+    "\"ble\":{\"garmin\":{\"rssi\":%d,\"found\":%s},\"phone\":{\"rssi\":%d,\"found\":%s}}"
+    "}\n\n",
     bmeOk ? bme.temperature    : 0.0,
     bmeOk ? bme.humidity       : 0.0,
-    bmeOk ? bme.pressure/100.0 : 0.0
+    bmeOk ? bme.pressure/100.0 : 0.0,
+    garminRssi, garminFound ? "true" : "false",
+    phoneRssi,  phoneFound  ? "true" : "false"
   );
 
   int j = 0;
@@ -256,28 +282,6 @@ void sendSSEEvent(bool speaking) {
     }
   }
   sseCount = j;
-}
-
-// ---------------------------------------------------------------------------
-void speakStatus() {
-  char text[128] = "";
-
-  if (bmeOk && bme.performReading()) {
-    snprintf(text, sizeof(text),
-             "%.1f度、%.0fパー、気圧%.0f",
-             bme.temperature, bme.humidity, bme.pressure / 100.0);
-  }
-
-  if (strlen(text) == 0) {
-    strncpy(text, "データを取得できませんでした", sizeof(text) - 1);
-  }
-
-  Serial.printf("[TTS] %s\n", text);
-  bool ok = audio.connecttospeech(text, "ja");
-  Serial.printf("[TTS] connect=%s  running=%s  heap=%u\n",
-                ok ? "OK" : "FAIL",
-                audio.isRunning() ? "yes" : "no",
-                ESP.getFreeHeap());
 }
 
 // ---------------------------------------------------------------------------

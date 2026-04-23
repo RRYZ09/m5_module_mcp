@@ -63,6 +63,22 @@ async def get_env() -> dict:
 
 
 @mcp.tool()
+async def get_ble_rssi() -> dict:
+    """
+    ENV PRO 機の BLE スキャン結果から Garmin ウォッチとスマホの電波強度を取得する。
+    Garmin は心拍転送モード（ハートレートブロードキャスト）が必要。
+
+    Returns:
+        scanning        : スキャン実行中かどうか
+        garmin.rssi     : Garmin の RSSI (dBm)、未検出なら 0
+        garmin.found    : 直近のスキャンで見つかったか
+        phone.rssi      : スマホの RSSI (dBm)、未検出なら 0
+        phone.found     : 直近のスキャンで見つかったか
+    """
+    return await _fetch(ENV_IPS, "/ble_rssi")
+
+
+@mcp.tool()
 async def get_gps() -> dict:
     """
     ATOMIC GPS Base から GPS データを取得する。
